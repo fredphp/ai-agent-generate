@@ -182,6 +182,11 @@ func parseArgs(args []string) (*Config, *Command, error) {
 }
 
 func run(ctx context.Context, config *Config, cmd *Command) error {
+        // Diagnose command doesn't need services initialization
+        if cmd.Type == "diagnose" {
+                return runDiagnose(ctx, config, cmd)
+        }
+
         services, err := initServices(config)
         if err != nil {
                 return fmt.Errorf("init services: %w", err)
@@ -197,8 +202,6 @@ func run(ctx context.Context, config *Config, cmd *Command) error {
 
         var result *orchestrator.Result
         switch cmd.Type {
-        case "diagnose":
-                return runDiagnose(ctx, config, cmd)
         case "refactor":
                 result = engine.Refactor(ctx, cmd.Files, cmd.Instruction, config.WorkDir)
         case "fix":
@@ -354,6 +357,14 @@ func printResult(result *orchestrator.Result, verbose bool) {
 }
 
 func runDiagnose(ctx context.Context, config *Config, cmd *Command) error {
+        // Get API key from environment if not set (needed for auto-fix)
+        if config.APIKey == "" {
+                config.APIKey = os.Getenv("GLM_API_KEY")
+                if config.APIKey == "" {
+                        config.APIKey = os.Getenv("ZHIPUAI_API_KEY")
+                }
+        }
+
         projectPath := config.WorkDir
         if len(cmd.Files) > 0 {
                 projectPath = cmd.Files[0]
@@ -429,20 +440,32 @@ func autoFixIssues(ctx context.Context, config *Config, diag *diagnose.Diagnoser
         apiKey := config.APIKey
         if apiKey == "" {
                 apiKey = os.Getenv("GLM_API_KEY")
-                if apiKey == "" {
-                        apiKey = os.Getenv("ZHIPUAI_API_KEY")
-                }
+        }
+        if apiKey == "" {
+                apiKey = os.Getenv("ZHIPUAI_API_KEY")
         }
 
-        if apiKey == "" {
-                return fmt.Errorf("API key required for auto-fix (set GLM_API_KEY)")
+        // Debug output
+        fmt.Printf("   🔑 API Key status: ")
+        if apiKey != "" {
+                fmt.Printf("found (length: %d)\n", len(apiKey))
+        } else {
+                fmt.Printf("NOT found\n")
+                fmt.Println("   Please check:")
+                fmt.Println("     1. Run: echo $GLM_API_KEY")
+                fmt.Println("     2. Or use: aidev diagnose . -k \"your-api-key\"")
+                return fmt.Errorf("API key required for auto-fix (set GLM_API_KEY or use -k flag)")
         }
 
         // Set API key to config before initializing services
         config.APIKey = apiKey
 
+        // Debug: verify API key is set
+        fmt.Printf("   🔧 Initializing services with API key (length: %d)...\n", len(config.APIKey))
+
         services, err := initServices(config)
         if err != nil {
+                fmt.Printf("   ❌ initServices failed: %v\n", err)
                 return fmt.Errorf("init services: %w", err)
         }
 
