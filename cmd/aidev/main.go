@@ -438,6 +438,9 @@ func autoFixIssues(ctx context.Context, config *Config, diag *diagnose.Diagnoser
                 return fmt.Errorf("API key required for auto-fix (set GLM_API_KEY)")
         }
 
+        // Set API key to config before initializing services
+        config.APIKey = apiKey
+
         services, err := initServices(config)
         if err != nil {
                 return fmt.Errorf("init services: %w", err)
