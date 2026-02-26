@@ -11,6 +11,7 @@ import (
         "syscall"
         "time"
 
+        "ai-dev-agent/service/diagnose"
         "ai-dev-agent/service/executor"
         "ai-dev-agent/service/filesystem"
         "ai-dev-agent/service/llm"
@@ -139,7 +140,7 @@ func parseArgs(args []string) (*Config, *Command, error) {
         i++
 
         switch cmd.Type {
-        case "refactor", "fix", "generate", "explain", "review", "test":
+        case "refactor", "fix", "generate", "explain", "review", "test", "diagnose":
         default:
                 return nil, nil, fmt.Errorf("unknown command: %s", cmd.Type)
         }
@@ -156,17 +157,20 @@ func parseArgs(args []string) (*Config, *Command, error) {
                 i++
         }
 
-        if len(cmd.Files) == 0 && cmd.Type != "generate" {
+        if len(cmd.Files) == 0 && cmd.Type != "generate" && cmd.Type != "diagnose" {
                 return nil, nil, fmt.Errorf("no target files specified")
         }
 
-        if config.APIKey == "" {
-                config.APIKey = os.Getenv("GLM_API_KEY")
+        // Diagnose command doesn't require API key
+        if cmd.Type != "diagnose" {
                 if config.APIKey == "" {
-                        config.APIKey = os.Getenv("ZHIPUAI_API_KEY")
-                }
-                if config.APIKey == "" {
-                        return nil, nil, fmt.Errorf("API key required (GLM_API_KEY or -k flag)")
+                        config.APIKey = os.Getenv("GLM_API_KEY")
+                        if config.APIKey == "" {
+                                config.APIKey = os.Getenv("ZHIPUAI_API_KEY")
+                        }
+                        if config.APIKey == "" {
+                                return nil, nil, fmt.Errorf("API key required (GLM_API_KEY or -k flag)")
+                        }
                 }
         }
 
@@ -193,6 +197,8 @@ func run(ctx context.Context, config *Config, cmd *Command) error {
 
         var result *orchestrator.Result
         switch cmd.Type {
+        case "diagnose":
+                return runDiagnose(ctx, config, cmd)
         case "refactor":
                 result = engine.Refactor(ctx, cmd.Files, cmd.Instruction, config.WorkDir)
         case "fix":
@@ -347,6 +353,214 @@ func printResult(result *orchestrator.Result, verbose bool) {
         fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 }
 
+func runDiagnose(ctx context.Context, config *Config, cmd *Command) error {
+        projectPath := config.WorkDir
+        if len(cmd.Files) > 0 {
+                projectPath = cmd.Files[0]
+        }
+
+        fmt.Println("\n🔍 Running project diagnosis...")
+        fmt.Printf("   Project: %s\n\n", projectPath)
+
+        diagConfig := diagnose.Config{
+                ProjectPath:  projectPath,
+                Timeout:      config.Timeout,
+                CheckConfig:  true,
+                CheckDeps:    true,
+                CheckBuild:   true,
+                CheckTests:   true,
+                CheckRuntime: false, // Skip runtime check by default
+                CheckLint:    true,
+                AutoFix:      true,
+                Verbose:      config.Verbose,
+        }
+
+        // Parse instruction for options
+        if cmd.Instruction != "" {
+                opts := strings.ToLower(cmd.Instruction)
+                if strings.Contains(opts, "runtime") || strings.Contains(opts, "run") {
+                        diagConfig.CheckRuntime = true
+                }
+                if strings.Contains(opts, "no-lint") {
+                        diagConfig.CheckLint = false
+                }
+                if strings.Contains(opts, "no-test") {
+                        diagConfig.CheckTests = false
+                }
+        }
+
+        diag := diagnose.NewDiagnoser(diagConfig)
+        result, err := diag.Run(ctx)
+        if err != nil {
+                return fmt.Errorf("diagnosis failed: %w", err)
+        }
+
+        printDiagnosticResult(result, config.Verbose)
+
+        // If auto-fix is enabled and there are issues, attempt to fix
+        if diagConfig.AutoFix && result.TotalIssues > 0 {
+                fmt.Println("\n🔧 Attempting auto-fix with AI...")
+                fixable := diag.GetFixableIssues()
+                if len(fixable) > 0 {
+                        if err := autoFixIssues(ctx, config, diag, fixable); err != nil {
+                                fmt.Printf("   ⚠ Auto-fix encountered issues: %v\n", err)
+                        }
+                } else {
+                        fmt.Println("   ℹ No auto-fixable issues found.")
+                }
+        }
+
+        if result.TotalIssues > 0 {
+                return fmt.Errorf("found %d issue(s)", result.TotalIssues)
+        }
+        return nil
+}
+
+func autoFixIssues(ctx context.Context, config *Config, diag *diagnose.Diagnoser, issues []diagnose.Issue) error {
+        // Group issues by file
+        issuesByFile := make(map[string][]diagnose.Issue)
+        for _, issue := range issues {
+                if issue.File != "" {
+                        issuesByFile[issue.File] = append(issuesByFile[issue.File], issue)
+                }
+        }
+
+        // Get API key for fixing
+        apiKey := config.APIKey
+        if apiKey == "" {
+                apiKey = os.Getenv("GLM_API_KEY")
+                if apiKey == "" {
+                        apiKey = os.Getenv("ZHIPUAI_API_KEY")
+                }
+        }
+
+        if apiKey == "" {
+                return fmt.Errorf("API key required for auto-fix (set GLM_API_KEY)")
+        }
+
+        services, err := initServices(config)
+        if err != nil {
+                return fmt.Errorf("init services: %w", err)
+        }
+
+        engine := orchestrator.NewEngine(
+                services.file,
+                services.prompt,
+                services.llm,
+                services.exec,
+                orchestrator.Config{MaxRetries: config.MaxRetries, BuildVerify: !config.DryRun, Logger: newLogger(config.Verbose)},
+        )
+
+        fixedCount := 0
+        for file, fileIssues := range issuesByFile {
+                // Build instruction from issues
+                var issueDescs []string
+                for _, issue := range fileIssues {
+                        issueDescs = append(issueDescs, fmt.Sprintf("- Line %d: %s (%s)", issue.Line, issue.Title, issue.Description))
+                }
+
+                instruction := fmt.Sprintf("Fix the following issues in this file:\n%s", strings.Join(issueDescs, "\n"))
+
+                fmt.Printf("\n   📝 Fixing %s (%d issue(s))...\n", file, len(fileIssues))
+
+                result := engine.Fix(ctx, []string{file}, instruction, config.WorkDir)
+                if result.Success {
+                        fmt.Printf("   ✅ Fixed %s\n", file)
+                        fixedCount += len(fileIssues)
+                } else {
+                        fmt.Printf("   ❌ Failed to fix %s: %v\n", file, result.Error)
+                }
+        }
+
+        fmt.Printf("\n   📊 Fixed %d issue(s) across %d file(s)\n", fixedCount, len(issuesByFile))
+        return nil
+}
+
+func printDiagnosticResult(result *diagnose.DiagnosticResult, verbose bool) {
+        fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        fmt.Println("  🔍 Diagnostic Report")
+        fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        fmt.Printf("\n  Project: %s\n", result.ProjectPath)
+        fmt.Printf("  Duration: %s\n\n", result.Duration)
+
+        // Status summary
+        fmt.Println("  Status:")
+        if result.BuildSuccess {
+                fmt.Println("    ✅ Build: OK")
+        } else {
+                fmt.Println("    ❌ Build: Failed")
+        }
+        if result.TestSuccess {
+                fmt.Println("    ✅ Tests: OK")
+        } else if !result.TestSuccess && len(result.Issues) > 0 {
+                hasTestIssues := false
+                for _, issue := range result.Issues {
+                        if issue.Category == diagnose.CategoryTest {
+                                hasTestIssues = true
+                                break
+                        }
+                }
+                if hasTestIssues {
+                        fmt.Println("    ❌ Tests: Failed")
+                }
+        }
+
+        // Issues summary
+        fmt.Printf("\n  Issues: %d total", result.TotalIssues)
+        if result.CriticalCount > 0 {
+                fmt.Printf(" | 🔴 %d critical", result.CriticalCount)
+        }
+        if result.ErrorCount > 0 {
+                fmt.Printf(" | 🟠 %d errors", result.ErrorCount)
+        }
+        if result.WarningCount > 0 {
+                fmt.Printf(" | 🟡 %d warnings", result.WarningCount)
+        }
+        fmt.Println()
+
+        // Detailed issues
+        if len(result.Issues) > 0 {
+                fmt.Println("\n  Detailed Issues:")
+                for i, issue := range result.Issues {
+                        if i >= 20 && !verbose {
+                                fmt.Printf("    ... and %d more issues\n", len(result.Issues)-20)
+                                break
+                        }
+
+                        levelIcon := "ℹ"
+                        switch issue.Level {
+                        case diagnose.LevelCritical:
+                                levelIcon = "🔴"
+                        case diagnose.LevelError:
+                                levelIcon = "🟠"
+                        case diagnose.LevelWarning:
+                                levelIcon = "🟡"
+                        }
+
+                        if issue.File != "" {
+                                fmt.Printf("    %s [%s] %s:%d - %s\n", levelIcon, issue.Category, issue.File, issue.Line, issue.Title)
+                        } else {
+                                fmt.Printf("    %s [%s] %s\n", levelIcon, issue.Category, issue.Title)
+                        }
+                        if verbose && issue.Description != "" {
+                                fmt.Printf("       %s\n", truncate(issue.Description, 100))
+                        }
+                        if issue.Suggestion != "" {
+                                fmt.Printf("       💡 %s\n", issue.Suggestion)
+                        }
+                }
+        }
+
+        fmt.Println("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+        if result.TotalIssues == 0 {
+                fmt.Println("  ✅ No issues found. Project is healthy!")
+        } else {
+                fmt.Printf("  ⚠ Found %d issue(s). Run with --verbose for details.\n", result.TotalIssues)
+        }
+        fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+}
+
 func printUsage() {
         fmt.Println(`AI Dev Agent - AI-powered code assistant
 
@@ -360,11 +574,14 @@ Commands:
   explain     Explain code
   review      Review code
   test        Generate tests
+  diagnose    Diagnose project issues and auto-fix
 
 Examples:
   aidev refactor server/handler.go
   aidev fix server/auth.go -- "Fix nil pointer"
   aidev generate api/user.go -- "Generate CRUD handlers"
+  aidev diagnose ./my-project
+  aidev diagnose . -- "runtime"   # Include runtime check
 
 Flags:
   -k, --api-key <key>     GLM API key
@@ -377,7 +594,7 @@ Flags:
   -w, --workdir <dir>     Working directory
 
 Environment:
-  GLM_API_KEY             API key (required)`)
+  GLM_API_KEY             API key (required for most commands)`)
 }
 
 func truncate(s string, max int) string {
